@@ -10,11 +10,12 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 // Message represents a conversation message
 type Message struct {
@@ -47,9 +48,18 @@ type TextContent struct {
 	Text string `json:"text"`
 }
 
+// CacheData holds all data needed for preview
+type CacheData struct {
+	Conversations map[string]Conversation `json:"conversations"`
+}
+
 func getProjectsDir() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".claude", "projects")
+}
+
+func getCachePath() string {
+	return filepath.Join(os.TempDir(), "ccs-cache.json")
 }
 
 func extractText(content json.RawMessage) string {
@@ -57,13 +67,11 @@ func extractText(content json.RawMessage) string {
 		return ""
 	}
 
-	// Try as string first
 	var str string
 	if err := json.Unmarshal(content, &str); err == nil {
 		return str
 	}
 
-	// Try as array
 	var arr []TextContent
 	if err := json.Unmarshal(content, &arr); err == nil {
 		var parts []string
@@ -78,83 +86,121 @@ func extractText(content json.RawMessage) string {
 	return ""
 }
 
-func getConversations() ([]Conversation, error) {
-	projectsDir := getProjectsDir()
-	var conversations []Conversation
-
-	err := filepath.Walk(projectsDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil // Skip errors
-		}
-
-		if info.IsDir() || !strings.HasSuffix(path, ".jsonl") {
-			return nil
-		}
-
-		if strings.HasPrefix(info.Name(), "agent-") {
-			return nil
-		}
-
-		sessionID := strings.TrimSuffix(info.Name(), ".jsonl")
-		conv := Conversation{SessionID: sessionID}
-
-		file, err := os.Open(path)
-		if err != nil {
-			return nil
-		}
-		defer file.Close()
-
-		scanner := bufio.NewScanner(file)
-		scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024) // 10MB buffer
-
-		for scanner.Scan() {
-			var raw RawMessage
-			if err := json.Unmarshal(scanner.Bytes(), &raw); err != nil {
-				continue
-			}
-
-			if raw.Type == "user" {
-				if conv.Cwd == "" {
-					conv.Cwd = raw.Cwd
-				}
-				text := extractText(raw.Message.Content)
-				if strings.TrimSpace(text) != "" {
-					if conv.FirstTimestamp == "" {
-						conv.FirstTimestamp = raw.Timestamp
-					}
-					conv.Messages = append(conv.Messages, Message{
-						Role: "user",
-						Text: text,
-						Ts:   raw.Timestamp,
-					})
-				}
-			} else if raw.Type == "assistant" {
-				text := extractText(raw.Message.Content)
-				if strings.TrimSpace(text) != "" {
-					conv.Messages = append(conv.Messages, Message{
-						Role: "assistant",
-						Text: text,
-						Ts:   raw.Timestamp,
-					})
-				}
-			}
-		}
-
-		if len(conv.Messages) > 0 {
-			if conv.Cwd == "" {
-				conv.Cwd = "unknown"
-			}
-			conversations = append(conversations, conv)
-		}
-
-		return nil
-	})
-
+func parseConversationFile(path string) (*Conversation, error) {
+	info, err := os.Stat(path)
 	if err != nil {
 		return nil, err
 	}
 
-	// Sort by timestamp descending
+	if strings.HasPrefix(info.Name(), "agent-") {
+		return nil, nil
+	}
+
+	sessionID := strings.TrimSuffix(info.Name(), ".jsonl")
+	conv := &Conversation{SessionID: sessionID}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024)
+
+	for scanner.Scan() {
+		var raw RawMessage
+		if err := json.Unmarshal(scanner.Bytes(), &raw); err != nil {
+			continue
+		}
+
+		if raw.Type == "user" {
+			if conv.Cwd == "" {
+				conv.Cwd = raw.Cwd
+			}
+			text := extractText(raw.Message.Content)
+			if strings.TrimSpace(text) != "" {
+				if conv.FirstTimestamp == "" {
+					conv.FirstTimestamp = raw.Timestamp
+				}
+				conv.Messages = append(conv.Messages, Message{
+					Role: "user",
+					Text: text,
+					Ts:   raw.Timestamp,
+				})
+			}
+		} else if raw.Type == "assistant" {
+			text := extractText(raw.Message.Content)
+			if strings.TrimSpace(text) != "" {
+				conv.Messages = append(conv.Messages, Message{
+					Role: "assistant",
+					Text: text,
+					Ts:   raw.Timestamp,
+				})
+			}
+		}
+	}
+
+	if len(conv.Messages) == 0 {
+		return nil, nil
+	}
+
+	if conv.Cwd == "" {
+		conv.Cwd = "unknown"
+	}
+
+	return conv, nil
+}
+
+func getConversations() ([]Conversation, error) {
+	projectsDir := getProjectsDir()
+
+	// Collect all jsonl files
+	var files []string
+	err := filepath.Walk(projectsDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !info.IsDir() && strings.HasSuffix(path, ".jsonl") && !strings.HasPrefix(info.Name(), "agent-") {
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse files in parallel
+	var wg sync.WaitGroup
+	results := make(chan *Conversation, len(files))
+
+	// Limit concurrency
+	sem := make(chan struct{}, 20)
+
+	for _, file := range files {
+		wg.Add(1)
+		go func(path string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			conv, err := parseConversationFile(path)
+			if err == nil && conv != nil {
+				results <- conv
+			}
+		}(file)
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var conversations []Conversation
+	for conv := range results {
+		conversations = append(conversations, *conv)
+	}
+
 	sort.Slice(conversations, func(i, j int) bool {
 		return conversations[i].FirstTimestamp > conversations[j].FirstTimestamp
 	})
@@ -211,6 +257,30 @@ func buildSearchLines(conversations []Conversation) ([]string, map[string]Conver
 	return lines, convMap
 }
 
+func saveCache(convMap map[string]Conversation) error {
+	data := CacheData{Conversations: convMap}
+	file, err := os.Create(getCachePath())
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return json.NewEncoder(file).Encode(data)
+}
+
+func loadCache() (map[string]Conversation, error) {
+	file, err := os.Open(getCachePath())
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var data CacheData
+	if err := json.NewDecoder(file).Decode(&data); err != nil {
+		return nil, err
+	}
+	return data.Conversations, nil
+}
+
 func highlight(text, query string) string {
 	if query == "" {
 		return text
@@ -250,7 +320,13 @@ func formatCodeBlock(text, query, indent string) string {
 	return strings.Join(result, "\n")
 }
 
-func showPreview(line, query string, convMap map[string]Conversation) {
+func showPreview(line, query string) {
+	convMap, err := loadCache()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Cache not found: %v\n", err)
+		return
+	}
+
 	parts := strings.Split(line, "\t")
 	if len(parts) == 0 {
 		return
@@ -346,7 +422,6 @@ Requirements:
 func main() {
 	args := os.Args[1:]
 
-	// Check for help/version
 	for _, arg := range args {
 		if arg == "-h" || arg == "--help" {
 			printHelp()
@@ -358,26 +433,17 @@ func main() {
 		}
 	}
 
-	// Internal preview mode
+	// Preview mode - reads from cache (fast!)
 	if len(args) >= 2 && args[0] == "--preview" {
 		line := args[1]
 		query := ""
 		if len(args) >= 3 {
 			query = args[2]
 		}
-
-		conversations, err := getConversations()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-
-		_, convMap := buildSearchLines(conversations)
-		showPreview(line, query, convMap)
+		showPreview(line, query)
 		return
 	}
 
-	// Collect flags to pass to claude
 	var claudeFlags []string
 	for _, arg := range args {
 		if strings.HasPrefix(arg, "-") {
@@ -385,7 +451,6 @@ func main() {
 		}
 	}
 
-	// Check projects dir exists
 	projectsDir := getProjectsDir()
 	if _, err := os.Stat(projectsDir); os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "Projects directory not found: %s\n", projectsDir)
@@ -393,17 +458,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Check fzf is installed
 	if _, err := exec.LookPath("fzf"); err != nil {
 		fmt.Fprintf(os.Stderr, "fzf not found. Install with: brew install fzf\n")
 		os.Exit(1)
 	}
 
+	fmt.Fprint(os.Stderr, "Loading conversations...")
 	conversations, err := getConversations()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading conversations: %v\n", err)
+		fmt.Fprintf(os.Stderr, "\rError loading conversations: %v\n", err)
 		os.Exit(1)
 	}
+	fmt.Fprint(os.Stderr, "\r                         \r")
 
 	if len(conversations) == 0 {
 		fmt.Fprintf(os.Stderr, "No conversations found\n")
@@ -416,10 +482,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Get path to self for preview
+	// Save cache for preview
+	if err := saveCache(convMap); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not save cache: %v\n", err)
+	}
+
 	self, _ := os.Executable()
 
-	// Run fzf
 	cmd := exec.Command("fzf",
 		"--ansi",
 		"--delimiter=\t",
@@ -439,7 +508,6 @@ func main() {
 
 	output, err := cmd.Output()
 	if err != nil {
-		// User cancelled (exit code 130) or no selection
 		return
 	}
 
@@ -470,12 +538,10 @@ func main() {
 	}
 	fmt.Println()
 
-	// Change to project directory
 	if err := os.Chdir(cwd); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not change to directory %s: %v\n", cwd, err)
 	}
 
-	// Exec claude
 	claudePath, err := exec.LookPath("claude")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "claude not found in PATH\n")
