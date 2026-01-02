@@ -44,7 +44,6 @@ ccs
 
 # Resume with auto-accept permissions
 ccs --dangerously-skip-permissions
-ccs -y
 ```
 
 ### Keybindings

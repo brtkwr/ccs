@@ -423,7 +423,6 @@ Any other flags are passed through to 'claude --resume'.
 Examples:
   ccs                                 Search and resume a conversation
   ccs --dangerously-skip-permissions  Resume with auto-accept permissions
-  ccs -y                              Same as above (short flag)
 
 Requirements:
   - fzf (brew install fzf)
