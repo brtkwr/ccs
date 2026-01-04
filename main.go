@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const version = "0.3.0"
+const version = "0.3.1"
 
 // Message represents a conversation message
 type Message struct {
@@ -385,22 +385,27 @@ func showPreview(line, query string) {
 		}
 	}
 
-	// Build set of indices to show (matches + 1 context on each side)
+	// Build set of indices to show
 	showSet := make(map[int]bool)
-	if len(matchIndices) > 0 {
-		for _, idx := range matchIndices {
-			if idx > 0 {
-				showSet[idx-1] = true
-			}
-			showSet[idx] = true
-			if idx < len(conv.Messages)-1 {
-				showSet[idx+1] = true
-			}
-		}
-	} else {
-		// No matches, show first 6 messages
-		for i := 0; i < 6 && i < len(conv.Messages); i++ {
+
+	// Always show first 2 and last 2 messages
+	for i := 0; i < 2 && i < len(conv.Messages); i++ {
+		showSet[i] = true
+	}
+	for i := len(conv.Messages) - 2; i < len(conv.Messages); i++ {
+		if i >= 0 {
 			showSet[i] = true
+		}
+	}
+
+	// Add matches with 1 context on each side
+	for _, idx := range matchIndices {
+		if idx > 0 {
+			showSet[idx-1] = true
+		}
+		showSet[idx] = true
+		if idx < len(conv.Messages)-1 {
+			showSet[idx+1] = true
 		}
 	}
 
@@ -555,7 +560,7 @@ func main() {
 		"--no-sort",
 		"--tabstop=4",
 		"--preview", fmt.Sprintf("%s --preview {} {q}", self),
-		"--preview-window=bottom:70%:wrap:+5",
+		"--preview-window=bottom:70%:wrap",
 		"--header=Search conversations | Enter to resume, Esc to quit",
 		"--prompt=Search: ",
 		"--height=90%",
