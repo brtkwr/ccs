@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/agentic-utils/ccs)](https://github.com/agentic-utils/ccs/releases/latest)
 [![License](https://img.shields.io/github/license/agentic-utils/ccs)](LICENSE)
 
-Search and resume [Claude Code](https://claude.ai/claude-code) conversations using fzf.
+Globally search and resume [Claude Code](https://claude.ai/claude-code) conversations using fzf.
 
 ![Demo](demo.gif)
 
