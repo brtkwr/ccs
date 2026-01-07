@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const version = "0.3.1"
+const version = "0.4.0"
 
 // Message represents a conversation message
 type Message struct {
@@ -270,15 +270,18 @@ func buildSearchLines(conversations []Conversation) ([]string, map[string]Conver
 		}
 
 		displayText := truncate(firstUserMsg.Text, 100)
-		searchText := strings.Join(strings.Fields(strings.Join(allUserText, " ")), " ")
-		ts := formatTimestamp(conv.LastTimestamp)
+		firstTs := formatTimestamp(conv.FirstTimestamp)
+		lastTs := formatTimestamp(conv.LastTimestamp)
+		// Include session ID, timestamps, project/cwd, and all user messages in search text
+		allSearchText := append([]string{conv.SessionID, firstTs, lastTs, conv.Cwd, project}, allUserText...)
+		searchText := strings.Join(strings.Fields(strings.Join(allSearchText, " ")), " ")
 		projectPad := padOrTruncate(project, 25)
 
 		// Format: id \t date \t project \t display_message \t search_text
+		// search_text hidden with zero-width or minimal display
 		// Colors: date=dim, project=yellow/bold, message=white
-		// search_text is hidden (column 5) but used for matching
 		line := fmt.Sprintf("%s\t\033[90m%s\033[0m\t\033[1;33m%s\033[0m\t%s\t%s",
-			conv.SessionID, ts, projectPad, displayText, searchText)
+			conv.SessionID, lastTs, projectPad, displayText, searchText)
 		lines = append(lines, line)
 	}
 
@@ -368,8 +371,10 @@ func showPreview(line, query string) {
 		return
 	}
 
-	fmt.Printf("\033[1;33mProject:\033[0m %s\n", conv.Cwd)
-	fmt.Printf("\033[1;33mSession:\033[0m %s\n", sessionID)
+	fmt.Printf("\033[1;33mProject:\033[0m %s\n", highlight(conv.Cwd, query))
+	fmt.Printf("\033[1;33mSession:\033[0m %s\n", highlight(sessionID, query))
+	fmt.Printf("\033[1;33mFirst activity:\033[0m %s\n", highlight(formatTimestamp(conv.FirstTimestamp), query))
+	fmt.Printf("\033[1;33mLast activity:\033[0m %s\n", highlight(formatTimestamp(conv.LastTimestamp), query))
 	fmt.Printf("\033[1;33mTotal messages:\033[0m %d\n\n", len(conv.Messages))
 
 	// Find all messages containing the query
@@ -507,10 +512,36 @@ func main() {
 		return
 	}
 
+	// Debug mode - dump search lines with optional filter highlight
+	for i, arg := range args {
+		if arg == "--dump" {
+			filter := ""
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				filter = args[i+1]
+			}
+			conversations, _ := getConversations()
+			lines, _ := buildSearchLines(conversations)
+			for _, line := range lines {
+				if filter != "" {
+					line = highlight(line, filter)
+				}
+				fmt.Println(line)
+			}
+			return
+		}
+	}
+
+	// Parse ccs args: positional arg is filter, args after -- go to claude
+	// Usage: ccs [filter] [-- claude-args...]
 	var claudeFlags []string
-	for _, arg := range args {
-		if strings.HasPrefix(arg, "-") {
-			claudeFlags = append(claudeFlags, arg)
+	var filterQuery string
+	for i, arg := range args {
+		if arg == "--" {
+			claudeFlags = args[i+1:]
+			break
+		}
+		if !strings.HasPrefix(arg, "-") && filterQuery == "" {
+			filterQuery = arg
 		}
 	}
 
@@ -552,11 +583,10 @@ func main() {
 
 	self, _ := os.Executable()
 
-	cmd := exec.Command("fzf",
+	fzfArgs := []string{
 		"--ansi",
 		"--delimiter=\t",
-		"--with-nth=2,3,4",
-		"--nth=2..",
+		"--exact",
 		"--no-sort",
 		"--tabstop=4",
 		"--preview", fmt.Sprintf("%s --preview {} {q}", self),
@@ -567,8 +597,12 @@ func main() {
 		"--layout=reverse",
 		"--border=rounded",
 		"--info=inline",
-	)
+	}
+	if filterQuery != "" {
+		fzfArgs = append(fzfArgs, "--query", filterQuery)
+	}
 
+	cmd := exec.Command("fzf", fzfArgs...)
 	cmd.Stdin = strings.NewReader(strings.Join(lines, "\n"))
 	cmd.Stderr = os.Stderr
 
