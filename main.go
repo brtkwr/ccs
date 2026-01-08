@@ -18,7 +18,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-const version = "0.5.0"
+var version = "dev"
 
 // Message represents a conversation message
 type Message struct {
