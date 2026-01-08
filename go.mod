@@ -1,4 +1,4 @@
-module github.com/brtkwr/ccs
+module github.com/agentic-utils/ccs
 
 go 1.24.0
 
