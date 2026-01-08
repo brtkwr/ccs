@@ -6,7 +6,7 @@
 
 Globally search and resume [Claude Code](https://claude.ai/claude-code) conversations.
 
-![Demo](demo.gif)
+[![asciicast](https://asciinema.org/a/JXHQVf8PGBG2Orsl.svg)](https://asciinema.org/a/JXHQVf8PGBG2Orsl)
 
 ## Features
 
