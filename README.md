@@ -14,6 +14,7 @@ Globally search and resume [Claude Code](https://claude.ai/claude-code) conversa
 - Preview conversation context with search term highlighting
 - See message counts and hit counts per conversation
 - Resume conversations directly from the search interface
+- Delete conversations with confirmation prompt
 - Pass flags through to `claude` (e.g., `--plan`)
 - Mouse wheel scrolling support
 
@@ -75,6 +76,7 @@ ccs buyer -- --plan
 
 - `↑/↓` or `Ctrl+P/N` - Navigate list
 - `Enter` - Resume selected conversation
+- `Ctrl+D` - Delete selected conversation (with confirmation)
 - `Ctrl+J/K` - Scroll preview
 - `Mouse wheel` - Scroll list or preview (context-aware)
 - `Ctrl+U` - Clear search

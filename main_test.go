@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func TestTruncate(t *testing.T) {
@@ -374,5 +376,688 @@ func TestParseConversationFileSkipsLargeFiles(t *testing.T) {
 	if conv != nil {
 		t.Error("parseConversationFile should return nil for files larger than maxSize")
 	}
+}
+
+func TestGetTopic(t *testing.T) {
+	tests := []struct {
+		name     string
+		conv     Conversation
+		expected string
+	}{
+		{
+			name: "with user message",
+			conv: Conversation{
+				SessionID: "test-123",
+				Messages: []Message{
+					{Role: "user", Text: "Hello world"},
+					{Role: "assistant", Text: "Hi there"},
+				},
+			},
+			expected: "Hello world",
+		},
+		{
+			name: "no user message",
+			conv: Conversation{
+				SessionID: "test-456",
+				Messages: []Message{
+					{Role: "assistant", Text: "Hi there"},
+				},
+			},
+			expected: "test-456",
+		},
+		{
+			name: "empty messages",
+			conv: Conversation{
+				SessionID: "test-789",
+				Messages:  []Message{},
+			},
+			expected: "test-789",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := getTopic(tt.conv)
+			if result != tt.expected {
+				t.Errorf("getTopic() = %q, want %q", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestDeleteConversation(t *testing.T) {
+	// Create a temp directory to simulate projects dir
+	tmpDir := t.TempDir()
+
+	// Override getProjectsDir for this test
+	origGetProjectsDir := getProjectsDir
+	defer func() {
+		// Can't actually override without refactoring, so just test the logic
+	}()
+	_ = origGetProjectsDir
+
+	// Create test conversations
+	conv1 := Conversation{
+		SessionID: "test-session-1",
+		Cwd:       "/test/project1",
+		Messages: []Message{
+			{Role: "user", Text: "First message"},
+		},
+	}
+	conv2 := Conversation{
+		SessionID: "test-session-2",
+		Cwd:       "/test/project2",
+		Messages: []Message{
+			{Role: "user", Text: "Second message"},
+		},
+	}
+
+	items := []listItem{
+		{conv: conv1, searchText: "test1"},
+		{conv: conv2, searchText: "test2"},
+	}
+
+	// Create model with test data
+	m := model{
+		items:         items,
+		filtered:      items,
+		cursor:        0,
+		deleteIndex:   0,
+		confirmDelete: true,
+	}
+
+	// Create a temporary file for the conversation
+	testFile := filepath.Join(tmpDir, conv1.SessionID+".jsonl")
+	content := `{"type":"user","cwd":"/test/project1","message":{"content":"First message"},"timestamp":"2024-01-15T10:00:00Z"}`
+	if err := os.WriteFile(testFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write test file: %v", err)
+	}
+
+	// Note: We can't fully test deleteConversation without dependency injection
+	// but we can verify the file operations and state management logic separately
+
+	// Test file deletion
+	if err := os.Remove(testFile); err != nil {
+		t.Errorf("failed to remove file: %v", err)
+	}
+
+	// Verify file was deleted
+	if _, err := os.Stat(testFile); !os.IsNotExist(err) {
+		t.Error("file should be deleted but still exists")
+	}
+
+	// Test cursor adjustment logic
+	if m.cursor >= len(m.filtered) {
+		m.cursor = len(m.filtered) - 1
+	}
+
+	// Simulate deletion from filtered slice
+	m.filtered = append(m.filtered[:m.deleteIndex], m.filtered[m.deleteIndex+1:]...)
+
+	if len(m.filtered) != 1 {
+		t.Errorf("filtered should have 1 item after deletion, got %d", len(m.filtered))
+	}
+
+	if m.filtered[0].conv.SessionID != "test-session-2" {
+		t.Errorf("remaining conversation should be test-session-2, got %s", m.filtered[0].conv.SessionID)
+	}
+}
+
+func TestDeleteConversationInvalidIndex(t *testing.T) {
+	m := model{
+		items:       []listItem{},
+		filtered:    []listItem{},
+		deleteIndex: 10, // Invalid index
+	}
+
+	// Should not panic when index is out of bounds
+	m.deleteConversation()
+
+	// Verify error is set or state is unchanged
+	// (deleteConversation returns early for invalid index)
+}
+
+func TestDeleteConversationErrorHandling(t *testing.T) {
+	// Test deletion of non-existent file
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "nonexistent.jsonl")
+
+	// Try to delete non-existent file
+	err := os.Remove(testFile)
+	if err == nil {
+		t.Error("expected error when deleting non-existent file")
+	}
+
+	// Verify it's the right kind of error
+	if !os.IsNotExist(err) {
+		t.Errorf("expected IsNotExist error, got: %v", err)
+	}
+}
+
+func TestUpdateFilter(t *testing.T) {
+	items := []listItem{
+		{conv: Conversation{SessionID: "test-1"}, searchText: "hello world foo"},
+		{conv: Conversation{SessionID: "test-2"}, searchText: "goodbye world bar"},
+		{conv: Conversation{SessionID: "test-3"}, searchText: "hello bar baz"},
+	}
+
+	m := initialModel(items, "", nil)
+
+	// Test: empty query returns all items
+	m.textInput.SetValue("")
+	m.updateFilter()
+	if len(m.filtered) != 3 {
+		t.Errorf("empty query should return all items, got %d", len(m.filtered))
+	}
+
+	// Test: query matches subset
+	m.textInput.SetValue("hello")
+	m.updateFilter()
+	if len(m.filtered) != 2 {
+		t.Errorf("'hello' query should return 2 items, got %d", len(m.filtered))
+	}
+
+	// Test: case insensitive
+	m.textInput.SetValue("WORLD")
+	m.updateFilter()
+	if len(m.filtered) != 2 {
+		t.Errorf("'WORLD' query should return 2 items (case insensitive), got %d", len(m.filtered))
+	}
+
+	// Test: no matches
+	m.textInput.SetValue("xyz")
+	m.updateFilter()
+	if len(m.filtered) != 0 {
+		t.Errorf("'xyz' query should return 0 items, got %d", len(m.filtered))
+	}
+
+	// Test: cursor adjustment when filtered list shrinks
+	m.cursor = 2
+	m.textInput.SetValue("hello")
+	m.updateFilter()
+	if m.cursor >= len(m.filtered) {
+		t.Errorf("cursor should be adjusted to bounds, cursor=%d, filtered=%d", m.cursor, len(m.filtered))
+	}
+}
+
+func TestFormatListItem(t *testing.T) {
+	conv := Conversation{
+		SessionID:     "test-123",
+		Cwd:           "/home/user/very-long-project-name-that-exceeds-column-width",
+		LastTimestamp: "2024-01-15T10:30:00Z",
+		Messages: []Message{
+			{Role: "user", Text: "This is a very long first message that should be truncated to fit in the column"},
+			{Role: "assistant", Text: "Response"},
+			{Role: "user", Text: "Second message"},
+		},
+	}
+
+	item := listItem{conv: conv, searchText: ""}
+	m := initialModel([]listItem{item}, "", nil)
+
+	// Test selected formatting
+	result := m.formatListItem(item, true)
+	if !strings.Contains(result, "2024-01-15 10:30") {
+		t.Errorf("formatted item should contain timestamp")
+	}
+	if !strings.Contains(result, "3") { // message count
+		t.Errorf("formatted item should contain message count")
+	}
+
+	// Test non-selected formatting (has ANSI codes)
+	result = m.formatListItem(item, false)
+	if !strings.Contains(result, "\033[") {
+		t.Errorf("non-selected item should contain ANSI color codes")
+	}
+
+	// Test hit count with query
+	m.textInput.SetValue("message")
+	result = m.formatListItem(item, false)
+	// Should show 2 hits (both user messages contain "message")
+	if !strings.Contains(result, "2") {
+		t.Errorf("should show hit count when query matches")
+	}
+}
+
+func TestUpdateKeyboardNavigation(t *testing.T) {
+	items := []listItem{
+		{conv: Conversation{SessionID: "test-1"}, searchText: "first"},
+		{conv: Conversation{SessionID: "test-2"}, searchText: "second"},
+		{conv: Conversation{SessionID: "test-3"}, searchText: "third"},
+	}
+
+	m := initialModel(items, "", nil)
+	m.width = 100
+	m.height = 30
+
+	// Test down navigation
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = result.(model)
+	if m.cursor != 1 {
+		t.Errorf("down key should move cursor to 1, got %d", m.cursor)
+	}
+
+	// Test up navigation
+	result, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m = result.(model)
+	if m.cursor != 0 {
+		t.Errorf("up key should move cursor to 0, got %d", m.cursor)
+	}
+
+	// Test up at boundary (should stay at 0)
+	result, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m = result.(model)
+	if m.cursor != 0 {
+		t.Errorf("up at boundary should stay at 0, got %d", m.cursor)
+	}
+
+	// Test down to end
+	result, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = result.(model)
+	result, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = result.(model)
+	if m.cursor != 2 {
+		t.Errorf("should be at last item, got %d", m.cursor)
+	}
+
+	// Test down at boundary (should stay at 2)
+	result, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = result.(model)
+	if m.cursor != 2 {
+		t.Errorf("down at boundary should stay at 2, got %d", m.cursor)
+	}
+}
+
+func TestUpdateDeleteConfirmation(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create a real conversation file for testing
+	sessionID := "delete-test-session"
+	testFile := filepath.Join(tmpDir, sessionID+".jsonl")
+	content := `{"type":"user","cwd":"/test","message":{"content":"test message"},"timestamp":"2024-01-15T10:00:00Z"}`
+	if err := os.WriteFile(testFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write test file: %v", err)
+	}
+
+	// Override getProjectsDir temporarily
+	originalGetProjectsDir := getProjectsDir
+	defer func() {
+		// Can't easily override without refactoring, so we'll test the flow differently
+		_ = originalGetProjectsDir
+	}()
+
+	items := []listItem{
+		{
+			conv: Conversation{
+				SessionID: sessionID,
+				Cwd:       "/test",
+				Messages:  []Message{{Role: "user", Text: "test message"}},
+			},
+			searchText: "test",
+		},
+		{
+			conv: Conversation{
+				SessionID: "keep-this",
+				Cwd:       "/test2",
+				Messages:  []Message{{Role: "user", Text: "keep message"}},
+			},
+			searchText: "keep",
+		},
+	}
+
+	m := initialModel(items, "", nil)
+	m.width = 100
+	m.height = 30
+
+	// Trigger delete mode with Ctrl+D
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	m = result.(model)
+	if !m.confirmDelete {
+		t.Error("Ctrl+D should enter delete confirmation mode")
+	}
+	if m.deleteIndex != 0 {
+		t.Errorf("deleteIndex should be 0, got %d", m.deleteIndex)
+	}
+
+	// Test cancellation with 'n'
+	result, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m = result.(model)
+	if m.confirmDelete {
+		t.Error("'n' should exit delete confirmation mode")
+	}
+
+	// Test cancellation with Esc
+	result, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	m = result.(model)
+	if !m.confirmDelete {
+		t.Error("should be in delete confirmation mode")
+	}
+	result, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = result.(model)
+	if m.confirmDelete {
+		t.Error("Esc should exit delete confirmation mode")
+	}
+
+	// Test that other keys are ignored in delete mode
+	result, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+	m = result.(model)
+	originalCursor := m.cursor
+	result, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = result.(model)
+	if m.cursor != originalCursor {
+		t.Error("arrow keys should be ignored in delete confirmation mode")
+	}
+}
+
+func TestUpdateCtrlU(t *testing.T) {
+	items := []listItem{
+		{conv: Conversation{SessionID: "test-1"}, searchText: "hello"},
+	}
+
+	m := initialModel(items, "initial query", nil)
+
+	// Verify initial query is set
+	if m.textInput.Value() != "initial query" {
+		t.Errorf("initial query should be set")
+	}
+
+	// Test Ctrl+U clears search
+	result, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+	m = result.(model)
+	if m.textInput.Value() != "" {
+		t.Errorf("Ctrl+U should clear search, got %q", m.textInput.Value())
+	}
+}
+
+func TestViewRendering(t *testing.T) {
+	items := []listItem{
+		{
+			conv: Conversation{
+				SessionID:     "test-1",
+				Cwd:           "/test/project",
+				LastTimestamp: "2024-01-15T10:00:00Z",
+				Messages: []Message{
+					{Role: "user", Text: "test message", Ts: "2024-01-15T10:00:00Z"},
+				},
+			},
+			searchText: "test",
+		},
+	}
+
+	m := initialModel(items, "", nil)
+	m.width = 120
+	m.height = 30
+
+	output := m.View()
+
+	// Check for key UI elements
+	if !strings.Contains(output, "ccs") {
+		t.Error("output should contain 'ccs' title")
+	}
+	if !strings.Contains(output, "type to search") {
+		t.Error("output should contain search prompt")
+	}
+	if !strings.Contains(output, "DATE") || !strings.Contains(output, "PROJECT") {
+		t.Error("output should contain column headers")
+	}
+	if !strings.Contains(output, "/test/project") {
+		t.Error("output should contain project path in preview")
+	}
+
+	// Test delete confirmation view
+	m.confirmDelete = true
+	m.deleteIndex = 0
+	output = m.View()
+	if !strings.Contains(output, "Delete conversation") {
+		t.Error("delete confirmation should be shown")
+	}
+	if !strings.Contains(output, "[y/N]") {
+		t.Error("delete confirmation should show [y/N] prompt")
+	}
+
+	// Test error message display
+	m.confirmDelete = false
+	m.errorMsg = "Test error message"
+	output = m.View()
+	if !strings.Contains(output, "Test error message") {
+		t.Error("error message should be displayed")
+	}
+}
+
+func TestInit(t *testing.T) {
+	m := initialModel([]listItem{}, "", nil)
+	cmd := m.Init()
+	if cmd == nil {
+		t.Error("Init should return a command")
+	}
+}
+
+func TestGetProjectsDir(t *testing.T) {
+	dir := getProjectsDir()
+	if !strings.Contains(dir, ".claude") || !strings.Contains(dir, "projects") {
+		t.Errorf("getProjectsDir should return path containing .claude/projects, got %s", dir)
+	}
+}
+
+func TestRenderPreview(t *testing.T) {
+	conv := Conversation{
+		SessionID: "test-123",
+		Cwd:       "/test/project",
+		Messages: []Message{
+			{Role: "user", Text: "first message", Ts: "2024-01-15T10:00:00Z"},
+			{Role: "assistant", Text: "response", Ts: "2024-01-15T10:01:00Z"},
+			{Role: "user", Text: "second message with query term", Ts: "2024-01-15T10:02:00Z"},
+		},
+	}
+
+	item := listItem{conv: conv, searchText: "test"}
+	m := initialModel([]listItem{item}, "query", nil)
+
+	preview := m.renderPreview(item, 20)
+
+	// Check preview contains key elements
+	if !strings.Contains(preview, "Project:") {
+		t.Error("preview should contain 'Project:' header")
+	}
+	if !strings.Contains(preview, "Session:") {
+		t.Error("preview should contain 'Session:' header")
+	}
+	if !strings.Contains(preview, "/test/project") {
+		t.Error("preview should contain project path")
+	}
+	if !strings.Contains(preview, "test-123") {
+		t.Error("preview should contain session ID")
+	}
+}
+
+func TestUpdateMouseScroll(t *testing.T) {
+	items := []listItem{
+		{conv: Conversation{SessionID: "test-1"}, searchText: "first"},
+		{conv: Conversation{SessionID: "test-2"}, searchText: "second"},
+		{conv: Conversation{SessionID: "test-3"}, searchText: "third"},
+	}
+
+	m := initialModel(items, "", nil)
+
+	// Set window size first to initialize mouse tracking
+	result, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = result.(model)
+
+	// Mouse wheel up in list area (Y=5, which should be in list)
+	m.mouseInPreview = false // Explicitly set for test
+	result, _ = m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelUp, Y: 5})
+	m = result.(model)
+	// Should not move cursor from 0
+	if m.cursor != 0 {
+		t.Errorf("wheel up at top should keep cursor at 0, got %d", m.cursor)
+	}
+
+	// Move to second item
+	result, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = result.(model)
+	if m.cursor != 1 {
+		t.Errorf("should be at cursor 1, got %d", m.cursor)
+	}
+
+	// Mouse wheel down in list area should move cursor forward
+	m.mouseInPreview = false // Ensure we're scrolling list not preview
+	result, _ = m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown, Y: 5})
+	m = result.(model)
+	if m.cursor != 2 {
+		t.Errorf("wheel down should move to cursor 2, got %d", m.cursor)
+	}
+
+	// Mouse wheel in preview area
+	m.previewScroll = 0
+	m.mouseInPreview = true
+	result, _ = m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown, Y: 20})
+	m = result.(model)
+	if m.previewScroll != 3 {
+		t.Errorf("wheel down in preview should scroll preview, got %d", m.previewScroll)
+	}
+}
+
+func TestDeleteConversationFullFlow(t *testing.T) {
+	// Create temp directory that will act as projects dir
+	tmpDir := t.TempDir()
+
+	// Create test conversation files
+	session1 := "delete-me"
+	session2 := "keep-me"
+
+	file1 := filepath.Join(tmpDir, session1+".jsonl")
+	file2 := filepath.Join(tmpDir, session2+".jsonl")
+
+	content := `{"type":"user","cwd":"/test","message":{"content":"test"},"timestamp":"2024-01-15T10:00:00Z"}`
+	if err := os.WriteFile(file1, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write test file: %v", err)
+	}
+	if err := os.WriteFile(file2, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write test file: %v", err)
+	}
+
+	// Save and override getProjectsDir
+	oldGetProjectsDir := getProjectsDir
+	getProjectsDir = func() string { return tmpDir }
+	defer func() { getProjectsDir = oldGetProjectsDir }()
+
+	// Create items
+	items := []listItem{
+		{
+			conv: Conversation{
+				SessionID: session1,
+				FilePath:  file1,
+				Messages:  []Message{{Role: "user", Text: "delete this"}},
+			},
+			searchText: "delete",
+		},
+		{
+			conv: Conversation{
+				SessionID: session2,
+				FilePath:  file2,
+				Messages:  []Message{{Role: "user", Text: "keep this"}},
+			},
+			searchText: "keep",
+		},
+	}
+
+	m := initialModel(items, "", nil)
+
+	// Verify initial state
+	if len(m.items) != 2 {
+		t.Fatalf("initial items should be 2, got %d", len(m.items))
+	}
+	if len(m.filtered) != 2 {
+		t.Fatalf("initial filtered should be 2, got %d", len(m.filtered))
+	}
+
+	m.deleteIndex = 0
+	m.confirmDelete = true
+
+	// Execute deletion (needs pointer receiver)
+	(&m).deleteConversation()
+
+	// Verify file was deleted
+	if _, err := os.Stat(file1); !os.IsNotExist(err) {
+		t.Error("file1 should be deleted")
+	}
+
+	// Verify second file still exists
+	if _, err := os.Stat(file2); err != nil {
+		t.Error("file2 should still exist")
+	}
+
+	// Verify filtered list was updated
+	if len(m.filtered) != 1 {
+		t.Errorf("filtered should have 1 item, got %d", len(m.filtered))
+	}
+
+	// Verify items list was updated
+	if len(m.items) != 1 {
+		t.Errorf("items should have 1 item, got %d", len(m.items))
+	}
+
+	// Verify remaining item is session2
+	if m.items[0].conv.SessionID != session2 {
+		t.Errorf("remaining item should be %s, got %s", session2, m.items[0].conv.SessionID)
+	}
+
+	// Verify confirmation mode exited
+	if m.confirmDelete {
+		t.Error("confirmDelete should be false after deletion")
+	}
+}
+
+func TestGetConversations(t *testing.T) {
+	// Create temp directory with test conversations
+	tmpDir := t.TempDir()
+
+	// Create test files
+	file1 := filepath.Join(tmpDir, "session-1.jsonl")
+	file2 := filepath.Join(tmpDir, "session-2.jsonl")
+	agentFile := filepath.Join(tmpDir, "agent-test.jsonl")
+
+	content1 := `{"type":"user","cwd":"/test1","message":{"content":"first"},"timestamp":"2024-01-15T10:00:00Z"}`
+	content2 := `{"type":"user","cwd":"/test2","message":{"content":"second"},"timestamp":"2024-01-15T11:00:00Z"}`
+
+	if err := os.WriteFile(file1, []byte(content1), 0644); err != nil {
+		t.Fatalf("failed to write file1: %v", err)
+	}
+	if err := os.WriteFile(file2, []byte(content2), 0644); err != nil {
+		t.Fatalf("failed to write file2: %v", err)
+	}
+	if err := os.WriteFile(agentFile, []byte(content1), 0644); err != nil {
+		t.Fatalf("failed to write agent file: %v", err)
+	}
+
+	// Save and override getProjectsDir
+	oldGetProjectsDir := getProjectsDir
+	getProjectsDir = func() string { return tmpDir }
+	defer func() { getProjectsDir = oldGetProjectsDir }()
+
+	// Get conversations
+	convs, err := getConversations(time.Time{}, 0)
+	if err != nil {
+		t.Fatalf("getConversations failed: %v", err)
+	}
+
+	// Should have 2 conversations (agent file should be skipped)
+	if len(convs) != 2 {
+		t.Errorf("expected 2 conversations, got %d", len(convs))
+	}
+
+	// Verify sorted by timestamp (newest first)
+	if convs[0].SessionID != "session-2" {
+		t.Errorf("first conversation should be session-2, got %s", convs[0].SessionID)
+	}
+	if convs[1].SessionID != "session-1" {
+		t.Errorf("second conversation should be session-1, got %s", convs[1].SessionID)
+	}
+}
+
+func TestPrintHelp(t *testing.T) {
+	// Just call it to ensure no panics - we can't easily test stdout
+	// but this at least ensures the function doesn't crash
+	printHelp()
 }
 

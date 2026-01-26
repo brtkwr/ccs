@@ -34,6 +34,7 @@ type Conversation struct {
 	FirstTimestamp string    `json:"first_timestamp"`
 	LastTimestamp  string    `json:"last_timestamp"`
 	Messages       []Message `json:"messages"`
+	FilePath       string    `json:"file_path"` // Full path to the .jsonl file
 }
 
 // RawMessage represents the JSON structure in conversation files
@@ -107,6 +108,9 @@ type model struct {
 	quitting       bool
 	claudeFlags    []string
 	mouseInPreview bool // Track if mouse is in preview area
+	confirmDelete  bool   // Are we in delete confirmation mode?
+	deleteIndex    int    // Index of item to delete
+	errorMsg       string // Show deletion errors
 }
 
 func initialModel(items []listItem, filterQuery string, claudeFlags []string) model {
@@ -129,7 +133,9 @@ func initialModel(items []listItem, filterQuery string, claudeFlags []string) mo
 func (m *model) updateFilter() {
 	query := m.textInput.Value()
 	if query == "" {
-		m.filtered = m.items
+		// Make a copy to avoid sharing backing array with m.items
+		m.filtered = make([]listItem, len(m.items))
+		copy(m.filtered, m.items)
 	} else {
 		// Exact substring matching (case-insensitive)
 		queryLower := strings.ToLower(query)
@@ -193,6 +199,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// Handle delete confirmation mode
+		if m.confirmDelete {
+			switch msg.String() {
+			case "y", "Y":
+				m.deleteConversation()
+				return m, nil
+			case "n", "N", "esc":
+				m.confirmDelete = false
+				return m, nil
+			}
+			return m, nil // Ignore all other keys
+		}
+
+		// Clear error message on any keypress in normal mode
+		if m.errorMsg != "" {
+			m.errorMsg = ""
+		}
+
 		switch msg.String() {
 		case "ctrl+c", "esc":
 			m.quitting = true
@@ -204,6 +228,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.quitting = true
 			return m, tea.Quit
+
+		case "ctrl+d":
+			if len(m.filtered) > 0 {
+				m.confirmDelete = true
+				m.deleteIndex = m.cursor
+			}
+			return m, nil
 
 		case "up", "ctrl+p":
 			if m.cursor > 0 {
@@ -256,7 +287,7 @@ func (m model) View() string {
 
 	// Title line with help right-aligned
 	title := fmt.Sprintf("ccs · claude code search · %s", version)
-	help := "↑/↓ Enter Ctrl+J/K Esc"
+	help := "Resume:Enter Delete:Ctrl+D Scroll:Ctrl+J/K Exit:Esc"
 	titlePadding := tableWidth - 2 - len(title) - len(help)
 	if titlePadding < 1 {
 		titlePadding = 1
@@ -264,14 +295,33 @@ func (m model) View() string {
 	b.WriteString(fmt.Sprintf("  \033[1;36mccs\033[0m \033[90m· claude code search · %s%s%s\033[0m\n",
 		version, strings.Repeat(" ", titlePadding), help))
 
-	// Search line with count right-aligned
-	count := fmt.Sprintf("(%d/%d)", len(m.filtered), len(m.items))
-	searchPadding := tableWidth - 2 - 2 - 40 - len(count) - 1 // 2 for indent, 2 for "> ", 40 for textInput, -1 to shift left
-	if searchPadding < 1 {
-		searchPadding = 1
+	// Search line or delete confirmation
+	var sections []string
+	var inputSection string
+	if m.confirmDelete {
+		topic := getTopic(m.filtered[m.deleteIndex].conv)
+		inputSection = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("196")). // Red
+			Render(fmt.Sprintf("Delete conversation \"%s\"? [y/N]", truncate(topic, 50)))
+		sections = append(sections, "  "+inputSection)
+	} else {
+		count := fmt.Sprintf("(%d/%d)", len(m.filtered), len(m.items))
+		searchPadding := tableWidth - 2 - 2 - 40 - len(count) - 1 // 2 for indent, 2 for "> ", 40 for textInput, -1 to shift left
+		if searchPadding < 1 {
+			searchPadding = 1
+		}
+		inputSection = fmt.Sprintf("  %s%s\033[90m%s\033[0m", m.textInput.View(), strings.Repeat(" ", searchPadding), count)
+		sections = append(sections, inputSection)
 	}
-	b.WriteString(fmt.Sprintf("  %s%s\033[90m%s\033[0m\n\n",
-		m.textInput.View(), strings.Repeat(" ", searchPadding), count))
+
+	// Show error message if set
+	if m.errorMsg != "" {
+		errorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+		sections = append(sections, "  "+errorStyle.Render(m.errorMsg))
+	}
+
+	b.WriteString(strings.Join(sections, "\n"))
+	b.WriteString("\n\n")
 
 	// Calculate heights
 	listHeight := m.height * 30 / 100
@@ -519,7 +569,9 @@ func padRight(s string, length int) string {
 // Data loading (preserved from original)
 // ============================================================================
 
-func getProjectsDir() string {
+// getProjectsDir returns the path to the Claude projects directory
+// Declared as a variable so it can be overridden in tests
+var getProjectsDir = func() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".claude", "projects")
 }
@@ -573,7 +625,10 @@ func parseConversationFile(path string, cutoff time.Time, maxSize int64) (*Conve
 	}
 
 	sessionID := strings.TrimSuffix(info.Name(), ".jsonl")
-	conv := &Conversation{SessionID: sessionID}
+	conv := &Conversation{
+		SessionID: sessionID,
+		FilePath:  path,
+	}
 
 	file, err := os.Open(path)
 	if err != nil {
@@ -712,6 +767,55 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen-3] + "..."
 }
 
+// getTopic returns the first user message or session ID
+func getTopic(conv Conversation) string {
+	for _, msg := range conv.Messages {
+		if msg.Role == "user" {
+			return msg.Text
+		}
+	}
+	return conv.SessionID
+}
+
+// deleteConversation removes the selected conversation from disk and UI
+func (m *model) deleteConversation() {
+	if m.deleteIndex >= len(m.filtered) {
+		return
+	}
+
+	conv := m.filtered[m.deleteIndex].conv
+
+	// Delete the file (ignore if already deleted)
+	if err := os.Remove(conv.FilePath); err != nil && !os.IsNotExist(err) {
+		m.errorMsg = fmt.Sprintf("Delete failed: %v", err)
+		m.confirmDelete = false
+		return
+	}
+
+	// Remove from filtered slice
+	m.filtered = append(m.filtered[:m.deleteIndex], m.filtered[m.deleteIndex+1:]...)
+
+	// Remove from items slice (find by SessionID)
+	for i, item := range m.items {
+		if item.conv.SessionID == conv.SessionID {
+			m.items = append(m.items[:i], m.items[i+1:]...)
+			break
+		}
+	}
+
+	// Adjust cursor
+	if len(m.filtered) == 0 {
+		m.cursor = 0
+	} else if m.cursor >= len(m.filtered) {
+		m.cursor = len(m.filtered) - 1
+	}
+	// Otherwise cursor stays at same position (shows next item)
+
+	// Exit confirmation mode
+	m.confirmDelete = false
+	m.errorMsg = ""
+}
+
 // buildItems creates list items from conversations
 func buildItems(conversations []Conversation) []listItem {
 	items := make([]listItem, 0, len(conversations))
@@ -769,6 +873,7 @@ Examples:
 Key bindings:
   ↑/↓, Ctrl+P/N   Navigate list
   Enter           Select and resume conversation
+  Ctrl+D          Delete conversation (with confirmation)
   Ctrl+J/K        Scroll preview
   Mouse wheel     Scroll list or preview (based on position)
   Ctrl+U          Clear search

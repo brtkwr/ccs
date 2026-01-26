@@ -13,6 +13,14 @@ go build
 go test -v -cover
 ```
 
+### Test Coverage
+
+- **Target**: 60%+ statement coverage
+- **Current**: ~69%
+- All new features must include tests
+- Break logic into testable functions when possible
+- Refactor for testability (e.g., use variables instead of functions for dependency injection)
+
 ### Run locally
 
 ```bash
@@ -69,7 +77,7 @@ go test -v -cover
 - `Conversation` - Parsed conversation with messages, timestamps, cwd
 - `Message` - Single message (role, text, timestamp)
 - `listItem` - Display item with conversation and search text
-- `model` - Bubbletea application state
+- `model` - Bubbletea application state (includes delete confirmation state)
 
 ### Key Functions
 
@@ -77,16 +85,18 @@ go test -v -cover
 - `parseConversationFile(path, cutoff, maxSize)` - Parses JSONL files, skips by mtime/size
 - `buildItems()` - Creates list items with searchable text
 - `initialModel()` - Sets up bubbletea TUI
-- `Update()` - Handles keyboard/mouse input
-- `View()` - Renders the TUI
+- `Update()` - Handles keyboard/mouse input, including delete confirmation
+- `View()` - Renders the TUI with delete confirmation prompt
 - `renderPreview()` - Renders conversation preview with highlights
 - `formatListItem()` - Formats a single list row
+- `deleteConversation()` - Removes conversation file and updates UI state
+- `getTopic()` - Extracts first user message as topic
 
 ### TUI Layout
 
 ```
-  ccs · claude code search                    ↑/↓ Enter Ctrl+J/K Esc
-  > type to search...                                       (N/total)
+  ccs · claude code search    Resume:Enter Delete:Ctrl+D Scroll:Ctrl+J/K Exit:Esc
+  > type to search...                                                     (N/total)
 
   DATE              PROJECT               TOPIC                 MSGS  HITS
 ────────────────────────────────────────────────────────────────────────────
